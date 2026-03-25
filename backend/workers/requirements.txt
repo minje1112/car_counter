@@ -1,0 +1,19 @@
+# Python AI Worker Dependencies
+
+# Computer Vision
+opencv-python==4.8.1.78
+numpy==1.24.3
+
+# AI/ML - YOLOv8
+ultralytics==8.1.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Database
+mysql-connector-python==8.2.0
+
+# Environment
+python-dotenv==1.0.0
+
+# Utilities
+pillow==10.1.0
