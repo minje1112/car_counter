@@ -164,6 +164,12 @@ def process_stream_frame(stream_id, rtsp_url, frame_output_path, annotation_rule
     consecutive_none_frames = 0
     max_consecutive_none = 5
 
+    # Initialize interval tracking variables
+    past_time = 0
+    interval_idx = 0
+    current_time = datetime.now(MONGOLIA_TZ).strftime('%Y%m%d_%H%M%S')
+    current_interval_counts = defaultdict(int)
+
     #width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     #height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')

@@ -154,49 +154,44 @@ const aiWorker = new Worker(
         }
 
         try {
-          const result = JSON.parse(outputData);
-
-          if (!result.success) {
-            cleanupTempFiles();
-            reject(new Error(result.error || 'AI processing failed'));
-            return;
-          }
-
-          // Update stream status and save count data to database
+          // The Python worker (sstart.py) saves counts directly to the database.
+          // Query the DB for the most recent total count for this stream so the
+          // frontend receives an accurate value even though the JSON output
+          // reports car_count: 0 (counts are accumulated per region in the DB).
           const pool = getPool();
-          
-          console.log(`📊 Processing AI result for stream ${streamId}: ${result.car_count} cars detected`);
-          
-          // 1. Update stream with latest count
-          const updateResult = await pool.query(
-            'UPDATE rtsp_streams SET last_ai_count = ?, last_ai_check = NOW() WHERE id = ?',
-            [result.car_count, streamId]
-          );
-          console.log(`✓ Updated stream ${streamId} record (affectedRows: ${updateResult[0].affectedRows})`);
-          
-          // 2. Save count to ai_car_counts table
-          const detections = result.detections || [];
-          const insertResult = await pool.query(
-            'INSERT INTO ai_car_counts (stream_id, car_count, detections, created_at) VALUES (?, ?, ?, NOW())',
-            [streamId, result.car_count, JSON.stringify(detections)]
-          );
-          console.log(`✓ Inserted record to ai_car_counts (ID: ${insertResult[0].insertId})`);
-          console.log(`✓ Stream ${streamId}: Saved count ${result.car_count} cars, ${detections.length} detections to database`);
 
-          // Cleanup temp files after successful database save
+          const [recentRows] = await pool.query(
+            `SELECT COALESCE(SUM(count), 0) AS total_count
+             FROM ai_car_counts
+             WHERE stream_id = ? AND count IS NOT NULL
+               AND created_at >= NOW() - INTERVAL 10 MINUTE`,
+            [streamId]
+          );
+          const latestCount = Number(recentRows[0]?.total_count) || 0;
+
+          console.log(`📊 AI result for stream ${streamId}: ${latestCount} vehicles counted (from DB)`);
+
+          // Update stream with latest count timestamp
+          await pool.query(
+            'UPDATE rtsp_streams SET last_ai_count = ?, last_ai_check = NOW() WHERE id = ?',
+            [latestCount, streamId]
+          );
+          console.log(`✓ Updated stream ${streamId} last_ai_count = ${latestCount}`);
+
+          // Cleanup temp files
           cleanupTempFiles();
 
           resolve({
             streamId,
-            carCount: result.car_count,
-            detections: detections.length,
+            carCount: latestCount,
+            detections: 0,
             timestamp: new Date().toISOString(),
             hasAnnotationRules: !!annotationRules,
             dataSaved: true
           });
 
         } catch (error) {
-          console.error('❌ Error parsing Python output or saving to database:', error);
+          console.error('❌ Error querying database after Python worker:', error);
           cleanupTempFiles();
           reject(error);
         }
