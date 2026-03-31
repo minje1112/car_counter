@@ -366,7 +366,15 @@ if __name__ == '__main__':
     stream_id = int(sys.argv[1])
     rtsp_url = sys.argv[2]
     output_path = sys.argv[3]
-    annotation_rules = sys.argv[4] if len(sys.argv) > 4 else None
+    annotation_rules = None
+    if len(sys.argv) > 4:
+        rules_arg = sys.argv[4]
+        # If it's a file path, read the file; otherwise treat as JSON string
+        if os.path.isfile(rules_arg):
+            with open(rules_arg, 'r') as f:
+                annotation_rules = f.read()
+        else:
+            annotation_rules = rules_arg
     
     result = process_stream_frame(stream_id, rtsp_url, output_path, annotation_rules)
     print(json.dumps(result))
