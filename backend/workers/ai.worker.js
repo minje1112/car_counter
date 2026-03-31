@@ -66,17 +66,17 @@ const aiWorker = new Worker(
     return new Promise((resolve, reject) => {
       // Prepare arguments for Python script using argparse format
       const pythonArgs = [
-        path.join(__dirname, 'sstart.py'),
-        '--video_path', rtspUrl,
-        '--stream_id', streamId.toString(),
-        '--csv_path', frameOutputPath
+        path.join(__dirname, 'car_counter_worker.py'),
+        streamId.toString(),
+        rtspUrl,
+        frameOutputPath
       ];
       
-      // Add annotation rules as JSON if available
+      // Add annotation rules as JSON string if available
       if (annotationRules) {
         rulesJson = path.join(__dirname, '..', 'assets', 'temp', `rules_${streamId}_${Date.now()}.json`);
         fs.writeFileSync(rulesJson, JSON.stringify(annotationRules));
-        pythonArgs.push('--json_path', rulesJson);
+        pythonArgs.push(rulesJson);
         console.log(`✓ Created rules JSON: ${rulesJson}`);
       }
       

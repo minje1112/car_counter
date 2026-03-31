@@ -18,3 +18,16 @@ python-dotenv==1.0.0
 # Utilities
 pillow==10.1.0
 pandas>=1.5.0
+
+# Geometry (region polygon calculations)
+shapely>=2.0.0
+
+# FFmpeg Python bindings (for sstart.py multi-stream worker)
+ffmpeg-python>=0.2.0
+
+# System monitoring
+psutil>=5.9.0
+tqdm>=4.65.0
+
+# GPU monitoring (optional – install only if NVIDIA GPU available)
+# pynvml>=11.5.0
