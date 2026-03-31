@@ -126,7 +126,7 @@ def save_counts_to_db(stream_id, region_name, count, interval_idx):
     cursor.execute(
         """INSERT INTO ai_car_counts (stream_id, flowId, polygon_id, count, time, interval_idx)
            VALUES (%s, %s, %s, %s, %s, %s)""",
-        (stream_id, f'flow-{stream_id}', region_name, count, datetime.now(), interval_idx),
+        (stream_id, region_name, region_name, count, datetime.now(), interval_idx),
     )
     conn.commit()
     cursor.close()

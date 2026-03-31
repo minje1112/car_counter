@@ -231,14 +231,21 @@ DELETE /api/annotations/:id      Delete annotation
 2. Frontend → POST /api/ai/streams/:id/start { interval: 60 }
 3. Backend adds repeatable job to BullMQ queue (runs every 60s)
 4. ai.worker.js picks up the job
-5. Spawns: python sstart.py --video_path <rtsp_url> --stream_id <id>
-6. Python connects to RTSP stream via OpenCV
-7. YOLOv8 (best_26.pt) detects and tracks vehicles
+5. Spawns: python car_counter_worker.py <stream_id> <rtsp_url> <output_path>
+6. Python connects to RTSP stream via OpenCV/FFmpeg
+7. YOLOv8 detects vehicles in a single captured frame
 8. Per-region counts are saved to ai_car_counts table
-9. Vehicle crossings saved to car_flow_records table
-10. Node worker queries DB and emits Socket.IO event: ai-job-completed
-11. Frontend receives event and updates live count display
+9. Node worker queries DB and emits Socket.IO event: ai-job-completed
+10. Frontend receives event and updates live count display
 ```
+
+**Alternative: Multi-stream continuous mode (recommended for ≤5 streams):**
+```
+python workers/sstart.py --headless
+```
+This runs one long-lived process that handles all active streams with ByteTrack
+object tracking across frames, saving counts periodically. See
+[STREAMING_GUIDE.md](./STREAMING_GUIDE.md) for details.
 
 ### AI Model Details
 - **Model:** Custom YOLOv8 (`best_26.pt`) trained on vehicle images
