@@ -398,7 +398,47 @@ async function initializeDatabase() {
     
     await pool.query(createAiCarCountsTableQuery);
     console.log('Table "ai_car_counts" is ready');
-    
+
+    // Add extended columns to ai_car_counts for region-based tracking (used by Python worker)
+    try {
+      const [flowIdCol] = await pool.query(`
+        SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'ai_car_counts' AND COLUMN_NAME = 'flowId'
+      `, [dbName]);
+      if (flowIdCol.length === 0) {
+        await pool.query(`
+          ALTER TABLE ai_car_counts
+          ADD COLUMN flowId VARCHAR(255) NULL COMMENT 'Region/flow name from annotation',
+          ADD COLUMN polygon_id VARCHAR(255) NULL COMMENT 'Polygon identifier from annotation',
+          ADD COLUMN count INT NULL COMMENT 'Vehicle count for this region/interval',
+          ADD COLUMN time VARCHAR(50) NULL COMMENT 'Interval timestamp (region-based counting)',
+          ADD COLUMN interval_idx INT NULL COMMENT 'Interval index for time-series counting'
+        `);
+        console.log('Added region-tracking columns to ai_car_counts table');
+      }
+    } catch (err) {
+      console.warn('Warning: Could not add region columns to ai_car_counts:', err.message);
+    }
+
+    // Create car_flow_records table for per-vehicle crossing records (used by Python worker)
+    const createCarFlowRecordsQuery = `
+      CREATE TABLE IF NOT EXISTS car_flow_records (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        stream_id INT NOT NULL,
+        flowId VARCHAR(255) NOT NULL COMMENT 'Region/flow name the vehicle crossed',
+        trackId INT NOT NULL COMMENT 'YOLO tracking ID',
+        category INT NOT NULL COMMENT 'Vehicle class ID',
+        time_seconds VARCHAR(50) COMMENT 'Timestamp of crossing',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_stream_id (stream_id),
+        INDEX idx_flow (stream_id, flowId),
+        INDEX idx_created_at (created_at),
+        FOREIGN KEY (stream_id) REFERENCES rtsp_streams(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `;
+    await pool.query(createCarFlowRecordsQuery);
+    console.log('Table "car_flow_records" is ready');
+
     // Add AI columns to rtsp_streams if they don't exist
     try {
       const [aiStatusColumns] = await pool.query(`

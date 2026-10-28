@@ -1,360 +1,577 @@
 #!/usr/bin/env python3
 """
-AI Car Counting Worker
-Processes frames from RTSP streams and counts cars using YOLOv8
+Multi-Stream Car Counter Worker (sstart.py)
+
+Processes multiple RTSP/HLS streams in a single process using one shared YOLO
+model and ByteTrack tracker. Designed to save RAM compared to spawning separate
+worker processes per stream.
+
+Modes of operation:
+  1. Database mode (default): Fetches active streams and their annotation rules
+     from MySQL automatically.
+  2. CLI mode: Pass stream URLs and optional JSON rule files via arguments.
+
+Usage examples:
+  # Database mode – processes all active streams from the DB:
+  python sstart.py
+
+  # Database mode with options:
+  python sstart.py --headless --save-interval 30 --model yolov8s.pt
+
+  # CLI mode – explicit URLs (no DB needed):
+  python sstart.py --urls "rtsp://cam1" "rtsp://cam2" --rules rule1.json rule2.json
 """
 
+from collections import defaultdict
+import argparse
+import json
+import logging
 import os
 import sys
-import json
 import time
-import logging
-import argparse
 from datetime import datetime
-from pathlib import Path
-import shutil
+
+import ffmpeg  # type: ignore
+import numpy as np
+import cv2
+from ultralytics import YOLO
 import torch
-from collections import defaultdict
-from utils import create_regions, is_inside_region, draw_regions
-from client import Client
-from datetime import datetime, timezone, timedelta
-import pandas as pd
+import psutil
+from tqdm import tqdm
+from shapely.geometry import Polygon, Point
 
-# Get the absolute path to the workers directory
-WORKERS_DIR = Path(__file__).parent.absolute()
-MODEL_DIR = WORKERS_DIR / 'model'
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
+# Optional GPU monitoring
 try:
-    import cv2
-    import numpy as np
-    from ultralytics import YOLO
-    from ultralytics.utils.plotting import colors
+    from pynvml import (
+        nvmlInit, nvmlDeviceGetHandleByIndex,
+        nvmlDeviceGetMemoryInfo, nvmlDeviceGetUtilizationRates, nvmlShutdown,
+    )
+    _HAS_NVML = True
+except ImportError:
+    _HAS_NVML = False
+
+# Database connector
+try:
     import mysql.connector
     from dotenv import load_dotenv
-    import subprocess
-except ImportError as e:
-    logger.error(f"Missing required package: {e}")
-    logger.error("Install with: pip install opencv-python ultralytics mysql-connector-python python-dotenv")
-    sys.exit(1)
+    _HAS_DB = True
+except ImportError:
+    _HAS_DB = False
 
-# Load environment variables
-load_dotenv()
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+)
+logger = logging.getLogger('sstart')
 
-# Database configuration
-DB_CONFIG = {
-    'host': os.getenv('DB_HOST', 'localhost'),
-    'user': os.getenv('DB_USER', 'root'),
-    'password': os.getenv('DB_PASSWORD', ''),
-    'database': os.getenv('DB_NAME', 'annotation_db'),
-    'port': int(os.getenv('DB_PORT', 3306))
-}
-conn = mysql.connector.connect(**DB_CONFIG)
+# ---------------------------------------------------------------------------
+# Region helper (reuses utils.py Region class)
+# ---------------------------------------------------------------------------
+# Ensure the workers directory is on the path so ``from utils import Region``
+# works regardless of the current working directory.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils import Region  # noqa: E402
 
-MONGOLIA_TZ = timezone(timedelta(hours=8))
+# Vehicle COCO class IDs: car, motorcycle, bus, truck
+VEHICLE_CLASSES = [2, 3, 5, 7]
 
-class CarCounterAI:
-    def __init__(self, model_path=None):
-        """Initialize the car counter with YOLO model"""
-        # Use absolute path to model file
-        if model_path is None:
-            model_path = str(MODEL_DIR / 'best_26.pt')
-        elif not os.path.isabs(model_path):
-            # Convert relative path to absolute
-            model_path = str(MODEL_DIR / model_path)
-        
-        self.model_path = model_path
-        self.model = None
-        self.car_classes = [0, 1, 2, 6, 7]
-        self.annotation_rules = None
-        self.preview = True
-        self.duration = 1
-        
-    def set_annotation_rules(self, rules):
-        self.annotation_rules = rules
-        logger.info(f"Annotation rules set: {rules}")
-        
-    def load_model(self):
-        try:
-            logger.info(f"Loading model from {self.model_path}")
-            self.model = YOLO(self.model_path).to('cuda' if torch.cuda.is_available() else 'cpu')
-            logger.info(f"Model loaded on {'cuda' if torch.cuda.is_available() else 'cpu'}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to load model: {e}")
-            return False
-    
-    def save_count_to_db(self, stream_id, car_count, detections_json):
-        try:
-            cursor = conn.cursor()
-            
-            # Limit detections to avoid exceeding column size (keep only first 50)
-            limited_detections = detections_json[:50] if isinstance(detections_json, list) else detections_json
-            
-            query = """
-                INSERT INTO ai_car_counts 
-                (stream_id, car_count, detections, created_at)
-                VALUES (%s, %s, %s, NOW())
-            """
-            
-            cursor.execute(query, (stream_id, car_count, json.dumps(limited_detections)))
-            conn.commit()
-            
-            cursor.close()
-            
-            logger.info(f"✓ Saved to DB: stream_id={stream_id}, car_count={car_count}, detections={len(limited_detections)}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Database error: {e}")
-            return False
-
-def process_stream_frame(stream_id, rtsp_url, frame_output_path, annotation_rules=None):
-    """Process video stream and count cars"""
-    # Initialize AI counter
-    counter = CarCounterAI()
-    
-    # Set annotation rules if provided
-    if annotation_rules:
-        if isinstance(annotation_rules, str):
-            annotation_rules = json.loads(annotation_rules)
-        counter.set_annotation_rules(annotation_rules)
-    
-    # Load model
-    if not counter.load_model():
-        logger.error("Failed to load AI model")
-        return False
-    
-    logger.info(f"Connecting to stream: {rtsp_url}")
-    
-    car_count = 0
-    frame_count = 0
-    consecutive_none_frames = 0
-    max_consecutive_none = 5
-    detections = []
-    reg_history = defaultdict(list)
-    track_history = defaultdict(list)
-    category_history = defaultdict(list)
-    device_arg = 'cuda:0' if torch.cuda.is_available() else 'cpu'      
-    
-    # Extract frame using OpenCV
-    logger.info(f"Connecting to stream: {rtsp_url}")
-    #cap = cv2.VideoCapture(rtsp_url)
-    client = Client(rtsp_url,
-                    verbose=False,
-                    read_timeout=6.0,      # 15 second timeout per frame
-                    freeze_threshold=3.0   # 3 seconds without frame = frozen
-                    )
-    width, height = client.width, client.height
-    polygons = annotation_rules.get('polygons', []) if annotation_rules else []
-    arrows = annotation_rules.get('arrows', []) if annotation_rules else []
-    regions = create_regions(width, height, polygons, arrows) 
-
-    polygon_id_map = {
-        polygon['text']: polygon.get('id', polygon.get('label', polygon.get('text')))
-        for polygon in polygons
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
+def _get_db_config():
+    """Return MySQL connection kwargs from environment variables."""
+    if _HAS_DB:
+        load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+    return {
+        'host': os.getenv('DB_HOST', 'localhost'),
+        'user': os.getenv('DB_USER', 'root'),
+        'password': os.getenv('DB_PASSWORD', ''),
+        'database': os.getenv('DB_NAME', 'car_counter_db'),
+        'port': int(os.getenv('DB_PORT', '3306')),
     }
-    
-    consecutive_none_frames = 0
-    max_consecutive_none = 5
 
-    #width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    #height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 
-    if counter.preview:
-        cv2.namedWindow('frame', cv2.WINDOW_AUTOSIZE)
-        
+def fetch_active_streams():
+    """Fetch all streams with ai_status='active' and their annotation rules."""
+    if not _HAS_DB:
+        logger.error('mysql-connector-python / python-dotenv not installed; cannot use DB mode.')
+        return []
+    cfg = _get_db_config()
+    conn = mysql.connector.connect(**cfg)
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT s.id, s.name, s.rtsp_url, s.ai_interval,
+               a.annotations AS annotation_rules
+        FROM rtsp_streams s
+        LEFT JOIN annotations a ON s.annotation_id = a.id
+        WHERE s.ai_status = 'active'
+        ORDER BY s.id
+    """)
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return rows
+
+
+def save_counts_to_db(stream_id, region_name, count, interval_idx):
+    """Insert a row into ai_car_counts."""
+    if not _HAS_DB:
+        return
+    cfg = _get_db_config()
+    conn = mysql.connector.connect(**cfg)
+    cursor = conn.cursor()
+    cursor.execute(
+        """INSERT INTO ai_car_counts (stream_id, flowId, polygon_id, count, time, interval_idx)
+           VALUES (%s, %s, %s, %s, %s, %s)""",
+        (stream_id, region_name, region_name, count, datetime.now(), interval_idx),
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def update_stream_last_count(stream_id, total_count):
+    """Update rtsp_streams.last_ai_count and last_ai_check."""
+    if not _HAS_DB:
+        return
+    cfg = _get_db_config()
+    conn = mysql.connector.connect(**cfg)
+    cursor = conn.cursor()
+    cursor.execute(
+        'UPDATE rtsp_streams SET last_ai_count = %s, last_ai_check = NOW() WHERE id = %s',
+        (total_count, stream_id),
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Stream & Region helpers
+# ---------------------------------------------------------------------------
+def build_regions_from_rules(rules, width, height):
+    """Parse annotation rules JSON and return a list of Region objects."""
+    if not rules:
+        return []
+    if isinstance(rules, str):
+        rules = json.loads(rules)
+    # Support both the annotation editor format (config.shapes) and flat list
+    shapes = rules.get('config', rules).get('shapes', rules)
+    polygons = shapes.get('Polygon', [])
+    arrows = shapes.get('Line', [])
+    regions = []
+    for poly, arrow in zip(polygons, arrows):
+        regions.append(Region(arrow=arrow, polygon=poly, frame_width=width, frame_height=height))
+    return regions
+
+
+def open_ffmpeg_process(url, w, h, fps=5):
+    """Open an FFmpeg subprocess that outputs raw BGR24 frames."""
+    return (
+        ffmpeg
+        .input(url)
+        .output(
+            'pipe:',
+            format='rawvideo',
+            pix_fmt='bgr24',
+            s=f'{w}x{h}',
+            r=fps,
+        )
+        .run_async(pipe_stdout=True)
+    )
+
+
+def probe_stream(url):
+    """Probe stream to get width/height."""
+    probe = ffmpeg.probe(url)
+    video = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+    return int(video['width']), int(video['height'])
+
+
+# ---------------------------------------------------------------------------
+# Core detection helpers
+# ---------------------------------------------------------------------------
+reg_history = defaultdict(list)
+
+
+def is_inside_region_simple(region, bbox_center, track_id):
+    """Check if center point is inside region polygon (no angle check)."""
+    if Polygon(region.polygon).contains(Point(bbox_center)):
+        reg_history[track_id].append(bbox_center)
+        if track_id not in region.track_ids:
+            region.track_ids[track_id] = track_id
+            return True
+    return False
+
+
+def count_detections(results_list, regions_per_stream, region_counts, frames=None):
+    """Count vehicles across all streams and their regions."""
+    offset = 0
+    for i, result_set in enumerate(results_list):
+        result = result_set[0] if isinstance(result_set, list) else result_set
+        if not hasattr(result, 'boxes') or result.boxes is None:
+            offset += len(regions_per_stream[i])
+            continue
+        boxes = result.boxes.xyxy.cpu()
+        if result.boxes.id is None or result.boxes.cls is None:
+            offset += len(regions_per_stream[i])
+            continue
+        track_ids = result.boxes.id.int().cpu().tolist()
+        classes = result.boxes.cls.cpu().tolist()
+        regions = regions_per_stream[i]
+        for box, tid, cls in zip(boxes, track_ids, classes):
+            if cls in VEHICLE_CLASSES:
+                cx = float((box[0] + box[2]) / 2)
+                cy = float((box[1] + box[3]) / 2)
+                for idx, region in enumerate(regions):
+                    if is_inside_region_simple(region, (cx, cy), tid):
+                        region_counts[offset + idx] += 1
+                        if frames is not None:
+                            x1, y1, x2, y2 = map(int, box)
+                            cv2.rectangle(frames[i], (x1, y1), (x2, y2), (0, 0, 255), 2)
+                            cv2.putText(frames[i], f'ID:{tid}', (x1, y1 - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        offset += len(regions)
+    return region_counts
+
+
+def draw_all_regions(frames, regions_per_stream):
+    """Draw polygon outlines on all frames."""
+    for i, regions in enumerate(regions_per_stream):
+        for region in regions:
+            cv2.polylines(frames[i], [region.polygon], True, (0, 255, 0), 2)
+
+
+def draw_counts_on_frame(frame, regions, counts_slice):
+    """Overlay count text on each region centroid."""
+    for idx, region in enumerate(regions):
+        pts = np.array(region.polygon, np.int32)
+        centroid = np.mean(pts, axis=0).astype(int)
+        cv2.putText(frame, str(counts_slice[idx]), (centroid[0], centroid[1]),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+
+
+# ---------------------------------------------------------------------------
+# Main processing loop
+# ---------------------------------------------------------------------------
+def run(streams, model_path='yolov8s.pt', width=440, height=360, fps=5,
+        display=True, save_interval=60, conf=0.3, iou=0.3):
+    """
+    Main processing loop for all streams.
+
+    Parameters
+    ----------
+    streams : list[dict]
+        Each dict must have: id, name, rtsp_url, annotation_rules (str/dict or None).
+    model_path : str
+        Path to the YOLO weights file.
+    width, height : int
+        Resolution to resize frames to.
+    fps : int
+        Target FPS for FFmpeg extraction.
+    display : bool
+        Whether to show OpenCV windows (set False for headless servers).
+    save_interval : int
+        Seconds between periodic DB saves.
+    conf, iou : float
+        YOLO confidence and IoU thresholds.
+    """
+    if not streams:
+        logger.error('No streams to process. Exiting.')
+        return
+
+    logger.info(f'Loading YOLO model: {model_path}')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = YOLO(model_path).to(device)
+    yolo_device = 0 if torch.cuda.is_available() else 'cpu'
+
+    # Build regions and open FFmpeg processes for each stream
+    processes = []
+    regions_per_stream = []
+    stream_ids = []
+    stream_names = []
+    for s in streams:
+        sid = s.get('id', 0)
+        url = s['rtsp_url']
+        rules = s.get('annotation_rules')
+        stream_ids.append(sid)
+        stream_names.append(s.get('name', f'stream-{sid}'))
+
+        regions = build_regions_from_rules(rules, width, height)
+        regions_per_stream.append(regions)
+
+        logger.info(f'Opening stream {sid} ({s.get("name", "?")}): {url}  '
+                     f'[{len(regions)} regions]')
+        proc = open_ffmpeg_process(url, width, height, fps)
+        processes.append(proc)
+
+    total_regions = sum(len(r) for r in regions_per_stream)
+    region_counts = [0] * total_regions
+    frame_size = width * height * 3
+    frame_count = 0
+    last_save_time = time.time()
+    interval_idx = 0
+
+    # GPU monitoring
+    gpu_available = False
+    gpu_handle = None
+    if _HAS_NVML:
+        try:
+            nvmlInit()
+            gpu_handle = nvmlDeviceGetHandleByIndex(0)
+            gpu_available = True
+        except Exception:
+            pass
+
+    progress_bar = tqdm(total=None, desc='Resource Monitor', dynamic_ncols=True,
+                        position=0, leave=True,
+                        bar_format='{l_bar}{bar}| {elapsed}  {postfix}')
+    region_bar = tqdm(total=0, desc='Region Detections', dynamic_ncols=True,
+                      position=1, leave=True,
+                      bar_format='{l_bar}{bar}| {postfix}')
+    start_time = time.time()
+
+    logger.info(f'Starting detection loop for {len(streams)} stream(s), '
+                f'save_interval={save_interval}s, display={display}')
+
     try:
-        while client.isOpened():
-            frame = client.read()
-            if frame is None:
-                consecutive_none_frames += 1
-                if consecutive_none_frames >= max_consecutive_none:
+        while True:
+            # Read frames from all streams
+            frames = []
+            all_ok = True
+            for proc in processes:
+                raw = proc.stdout.read(frame_size)
+                if len(raw) < frame_size:
+                    all_ok = False
                     break
+                frame = np.frombuffer(raw, np.uint8).reshape((height, width, 3)).copy()
+                frames.append(frame)
+
+            if not all_ok:
+                logger.warning('Stream read failure. Reconnecting in 5s...')
+                for p in processes:
+                    try:
+                        p.stdout.close()
+                        p.wait()
+                    except Exception:
+                        pass
+                time.sleep(5)
+                processes = []
+                for s in streams:
+                    try:
+                        proc = open_ffmpeg_process(s['rtsp_url'], width, height, fps)
+                        processes.append(proc)
+                    except Exception as e:
+                        logger.error(f'Reconnect failed for stream {s.get("id")}: {e}')
+                        processes.append(None)
+                if any(p is None for p in processes):
+                    logger.error('Could not reconnect all streams. Retrying...')
+                    time.sleep(5)
                 continue
-            else:
-                consecutive_none_frames = 0
 
-            frame = frame.copy()
-             
-            if past_time > counter.duration:
-                past_time = 0
-                interval_idx += 1
-                time = datetime.now(MONGOLIA_TZ).strftime('%Y-%m-%d %H:%M:%S')
+            # Resource monitoring
+            elapsed = time.time() - start_time
+            elapsed_str = time.strftime('%H:%M:%S', time.gmtime(elapsed))
+            proc_info = psutil.Process(os.getpid())
+            mem_mb = proc_info.memory_info().rss / 1024 ** 2
+            cpu_pct = proc_info.cpu_percent(interval=0.01)
+            postfix = (f'Elapsed: {elapsed_str} | Frame: {frame_count} | '
+                       f'RAM: {mem_mb:.1f}MB | CPU: {cpu_pct:.1f}%')
+            if gpu_available and gpu_handle is not None:
+                try:
+                    gm = nvmlDeviceGetMemoryInfo(gpu_handle)
+                    gu = nvmlDeviceGetUtilizationRates(gpu_handle)
+                    postfix += f' | GPU: {gu.gpu}% | GPU Mem: {gm.used / 1024 / 1024:.1f}MB'
+                except Exception:
+                    postfix += ' | GPU: N/A'
+            progress_bar.set_postfix_str(postfix)
+            progress_bar.update(1)
+            frame_count += 1
 
-                for region in regions:
-                    polygon_id = polygon_id_map.get(region.name, region.name)
-                    count = current_interval_counts[polygon_id]
+            # Run YOLO + ByteTrack on each frame
+            results_list = []
+            for f in frames:
+                res = model.track(f, persist=True, conf=conf, iou=iou,
+                                  tracker='bytetrack.yaml', verbose=False,
+                                  device=yolo_device)
+                results_list.append(res)
 
-                    cursor = conn.cursor()
-                    query = """
-                        INSERT INTO ai_car_counts 
-                        (stream_id, flowId, polygon_id, count, time, interval_idx)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                    """
-                    cursor.execute(query, (stream_id, region.name, polygon_id, count, time, interval_idx))
-                    conn.commit()
-                    cursor.close()
-
-                    logger.info(f"Saved count to DB: stream_id={stream_id}, flowId={region.name}, polygon_id={polygon_id}, count={count}, time={time}, interval_idx={interval_idx}")
-
-                current_interval_counts = defaultdict(int)
-                past_time = 0
-                current_time = datetime.now(MONGOLIA_TZ).strftime('%Y%m%d_%H%M%S')
-
-            results = counter.model.track(
-                frame, persist=True, conf=0.3, iou=0.3,verbose=False, tracker="bytetrack.yaml",
-                device=device_arg, half=torch.cuda.is_available()
+            # Count vehicles in regions
+            region_counts = count_detections(
+                results_list, regions_per_stream, region_counts,
+                frames=frames if display else None,
             )
 
-            for result in results:
-                boxes = result.boxes.xyxy.cpu()  
-                if result.boxes.id is None:
-                    continue
-                track_ids = result.boxes.id.int().cpu().tolist() 
-                classes = result.boxes.cls.cpu().tolist() 
+            # Region bar
+            parts = []
+            offset = 0
+            for i, regions in enumerate(regions_per_stream):
+                for idx, region in enumerate(regions):
+                    parts.append(f'S{stream_ids[i]}-{region.name}: {region_counts[offset + idx]}')
+                offset += len(regions)
+            region_bar.set_postfix_str(' | '.join(parts))
+            region_bar.n = sum(region_counts)
+            region_bar.refresh()
 
-                for box, track_id, cls in zip(boxes, track_ids, classes):
-                    bbox_center = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
-                    cv2.putText(frame, f'{track_id}', (int(bbox_center[0]) - 20, int(bbox_center[1]) - 20), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-
-                    # Update track history for drawing the trajectory
-                    track_history[track_id].append((float(bbox_center[0]), float(bbox_center[1])))
-                    track_history[track_id] = track_history[track_id][-20:]  # Keep the last 20 points
-
-                    if cls in counter.car_classes:
-                        mapped_cls = 0
-                    else:
-                        mapped_cls = cls
-                    category_history[track_id].append(mapped_cls)
-
-                    cv2.circle(frame, (int(bbox_center[0]), int(bbox_center[1])), 5, colors(cls, True), -1)
-                    points = np.hstack(track_history[track_id]).astype(np.int32).reshape((-1, 1, 2))
-                    cv2.polylines(frame, [points], isClosed=False, color=colors(cls, True), thickness=2)
-
-                    # Check if the object is inside any defined region
-                    for region in regions:
-                        if is_inside_region(region, bbox_center, reg_history, track_id): 
-                            cursor = conn.cursor()
-                            query = """
-                                    INSERT INTO car_flow_records 
-                                    (stream_id, flowId, trackId, category, time_seconds)
-                                    VALUES (%s, %s, %s, %s, %s)
-                                    """
-                            cursor.execute(query, (stream_id, region.name, track_id, mapped_cls, current_time))
-                            conn.commit()
-                            cursor.close()
-
-                            logger.info(f"Saved count to DB: stream_id={stream_id}, flowId={region.name}, polygon_id={polygon_id}, count={count}, time={time}, interval_idx={interval_idx}")
-                                                    
-                            polygon_id = polygon_id_map.get(region.name, region.name)
-                            current_interval_counts[polygon_id] += 1
-
-            draw_regions(regions, frame)  
-            past_time = datetime.now().timestamp() - datetime.strptime(current_time, '%Y%m%d_%H%M%S').timestamp()
-
-            if counter.preview:
-                cv2.imshow('frame', frame)
-                if cv2.waitKey(25) & 0xFF == ord('q'):
+            # Display (if not headless)
+            if display:
+                draw_all_regions(frames, regions_per_stream)
+                offset = 0
+                for i, regions in enumerate(regions_per_stream):
+                    n = len(regions)
+                    draw_counts_on_frame(frames[i], regions, region_counts[offset:offset + n])
+                    cv2.imshow(f'Stream {stream_ids[i]}: {stream_names[i]}', frames[i])
+                    offset += n
+                if cv2.waitKey(int(1000 / fps)) == 27:
+                    logger.info('ESC pressed – exiting.')
                     break
-        
-    except: logging.exception("Error during video processing.")
-    finally: 
-        # Save final interval to database if any data exists
-        cursor = conn.cursor()
 
-        if any(current_interval_counts.values()):                        
-            for region in regions:
-                polygon_id = polygon_id_map.get(region.name, region.name)
-                count = current_interval_counts[polygon_id]
-                query = """
-                        INSERT INTO ai_car_counts 
-                        (stream_id, flowId, polygon_id, count, time, interval_idx)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        """
-                cursor.execute(query, (stream_id, region.name, polygon_id, count, time, interval_idx))
-        
-        conn.commit()
-        cursor.close()
+            # Periodic database save
+            now = time.time()
+            if now - last_save_time >= save_interval:
+                offset = 0
+                for i, regions in enumerate(regions_per_stream):
+                    total_for_stream = 0
+                    for idx, region in enumerate(regions):
+                        cnt = region_counts[offset + idx]
+                        total_for_stream += cnt
+                        try:
+                            save_counts_to_db(stream_ids[i], region.name, cnt, interval_idx)
+                        except Exception as e:
+                            logger.error(f'DB save error stream {stream_ids[i]}: {e}')
+                    try:
+                        update_stream_last_count(stream_ids[i], total_for_stream)
+                    except Exception as e:
+                        logger.error(f'DB update error stream {stream_ids[i]}: {e}')
+                    offset += len(regions)
+                interval_idx += 1
+                last_save_time = now
+                logger.info(f'Saved counts to DB (interval {interval_idx}): {region_counts}')
 
-        logger.info(f"Saved count to DB: stream_id={stream_id}, flowId={region.name}, polygon_id={polygon_id}, count={count}, time={time}, interval_idx={interval_idx}")
-                              
-        #cap.release()
-        conn.close()
-        cv2.destroyAllWindows()
+    except KeyboardInterrupt:
+        logger.info('Interrupted by user.')
+    finally:
+        for p in processes:
+            try:
+                p.stdout.close()
+                p.wait()
+            except Exception:
+                pass
+        if display:
+            cv2.destroyAllWindows()
+        progress_bar.close()
+        region_bar.close()
+        if gpu_available and _HAS_NVML:
+            try:
+                nvmlShutdown()
+            except Exception:
+                pass
+    logger.info('Worker stopped.')
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Multi-stream car counter worker. '
+                    'By default, fetches active streams from the database.',
+    )
+    parser.add_argument('--urls', nargs='+', default=None,
+                        help='Stream URLs (CLI mode). If omitted, streams are '
+                             'fetched from the database.')
+    parser.add_argument('--rules', nargs='+', default=None,
+                        help='JSON annotation rule files, one per URL (CLI mode).')
+    parser.add_argument('--model', default='yolov8s.pt',
+                        help='YOLO model path (default: yolov8s.pt)')
+    parser.add_argument('--width', type=int, default=440)
+    parser.add_argument('--height', type=int, default=360)
+    parser.add_argument('--fps', type=int, default=5)
+    parser.add_argument('--conf', type=float, default=0.3,
+                        help='YOLO confidence threshold')
+    parser.add_argument('--iou', type=float, default=0.3,
+                        help='YOLO IoU threshold for NMS')
+    parser.add_argument('--headless', action='store_true',
+                        help='Run without display (for servers)')
+    parser.add_argument('--save-interval', type=int, default=60,
+                        help='Seconds between DB saves (default: 60)')
+    # Legacy argparse args used when called from ai.worker.js
+    parser.add_argument('--video_path', default=None, help=argparse.SUPPRESS)
+    parser.add_argument('--stream_id', default=None, help=argparse.SUPPRESS)
+    parser.add_argument('--csv_path', default=None, help=argparse.SUPPRESS)
+    parser.add_argument('--json_path', default=None, help=argparse.SUPPRESS)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # Legacy mode: called from ai.worker.js with --video_path / --stream_id
+    if args.video_path and args.stream_id:
+        logger.info(f'Legacy mode: processing single stream {args.stream_id}')
+        rules = None
+        if args.json_path and os.path.exists(args.json_path):
+            with open(args.json_path, 'r') as f:
+                rules = json.load(f)
+        streams = [{
+            'id': int(args.stream_id),
+            'name': f'stream-{args.stream_id}',
+            'rtsp_url': args.video_path,
+            'annotation_rules': rules,
+        }]
+        run(streams, model_path=args.model,
+            width=args.width, height=args.height, fps=args.fps,
+            display=not args.headless, save_interval=args.save_interval,
+            conf=args.conf, iou=args.iou)
+        return
+
+    # CLI mode: explicit URLs
+    if args.urls:
+        streams = []
+        for i, url in enumerate(args.urls):
+            rules = None
+            if args.rules and i < len(args.rules):
+                with open(args.rules[i], 'r') as f:
+                    rules = json.load(f)
+            streams.append({
+                'id': i + 1,
+                'name': f'stream-{i + 1}',
+                'rtsp_url': url,
+                'annotation_rules': rules,
+            })
+        run(streams, model_path=args.model,
+            width=args.width, height=args.height, fps=args.fps,
+            display=not args.headless, save_interval=args.save_interval,
+            conf=args.conf, iou=args.iou)
+        return
+
+    # Database mode (default): fetch active streams
+    logger.info('Database mode: fetching active streams...')
+    rows = fetch_active_streams()
+    if not rows:
+        logger.error('No active streams found in database. '
+                     'Add streams via the web UI or API and set ai_status to "active".')
+        sys.exit(1)
+
+    streams = []
+    for row in rows:
+        streams.append({
+            'id': row['id'],
+            'name': row['name'],
+            'rtsp_url': row['rtsp_url'],
+            'annotation_rules': row.get('annotation_rules'),
+        })
+    logger.info(f'Found {len(streams)} active stream(s): '
+                f'{[s["name"] for s in streams]}')
+
+    run(streams, model_path=args.model,
+        width=args.width, height=args.height, fps=args.fps,
+        display=not args.headless, save_interval=args.save_interval,
+        conf=args.conf, iou=args.iou)
+
 
 if __name__ == '__main__':
-    """
-    Command line interface for testing
-    Usage: python sstart.py --video_path "https://..." --json_path "config.json" --csv_path "output.csv" --save_video --preview
-    """
-    parser = argparse.ArgumentParser(description='AI Car Counting Video Processor')
-    parser.add_argument('--video_path', type=str, required=True, help='Path or URL to video stream')
-    parser.add_argument('--json_path', type=str, help='Path to JSON config file')
-    parser.add_argument('--csv_path', type=str, help='Path to save CSV results')
-    parser.add_argument('--save_video', action='store_true', help='Save processed video output')
-    parser.add_argument('--preview', action='store_true', help='Show video preview while processing')
-    parser.add_argument('--stream_id', type=int, default=1, help='Stream ID for database')
-    
-    args = parser.parse_args()
-    
-    logger.info(f"Starting video processing:")
-    logger.info(f"  Video: {args.video_path}")
-    logger.info(f"  JSON Config: {args.json_path}")
-    logger.info(f"  CSV Output: {args.csv_path}")
-    logger.info(f"  Save Video: {args.save_video}")
-    logger.info(f"  Preview: {args.preview}")
-    
-    # Load annotation rules from JSON if provided
-    annotation_rules = None
-    if args.json_path and os.path.exists(args.json_path):
-        try:
-            with open(args.json_path, 'r') as f:
-                annotation_rules = json.load(f)
-                logger.info(f"Loaded annotation rules from {args.json_path}")
-        except Exception as e:
-            logger.error(f"Failed to load annotation rules: {e}")
-    
-    # Process video stream
-    try:
-        result_ok = process_stream_frame(
-            stream_id=args.stream_id,
-            rtsp_url=args.video_path,
-            frame_output_path=args.csv_path,
-            annotation_rules=annotation_rules
-        )
-        
-        result = {
-            'success': result_ok,
-            'video_path': args.video_path,
-            'car_count': 0,  # Note: actual count saved to DB by process_stream_frame
-            'detections': [],
-            'csv_saved': args.csv_path is not None,
-            'video_saved': args.save_video,
-            'preview_enabled': args.preview,
-            'timestamp': datetime.now().isoformat(),
-            'message': 'Video processed successfully' if result_ok else 'Video processing completed with errors'
-        }
-    except Exception as e:
-        logger.error(f"Video processing failed: {e}")
-        result = {
-            'success': False,
-            'video_path': args.video_path,
-            'car_count': 0,
-            'detections': [],
-            'csv_saved': False,
-            'video_saved': False,
-            'preview_enabled': args.preview,
-            'timestamp': datetime.now().isoformat(),
-            'message': str(e)
-        }
-    
-    print(json.dumps(result, indent=2))
+    main()

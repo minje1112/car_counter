@@ -3,3 +3,5 @@ yarn.lock
 dist/
 build
 .next
+.env.local
+.env

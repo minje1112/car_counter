@@ -116,7 +116,7 @@ app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
   customSiteTitle: 'Konva API Documentation'
 }));
 
-// API Documentation page
+// API landing page
 app.get('/', (req, res) => {
   const htmlDoc = `
 <!DOCTYPE html>
@@ -124,28 +124,58 @@ app.get('/', (req, res) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Konva Annotation API Documentation</title>
+  <title>Car Counter API</title>
   <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-    
+    * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       line-height: 1.6;
-      color: #333;
+      color: #fff;
       background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
       min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       padding: 2rem;
     }
-    
+    .card {
+      background: rgba(255,255,255,0.15);
+      backdrop-filter: blur(10px);
+      border-radius: 16px;
+      padding: 2.5rem 3rem;
+      max-width: 480px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.2);
     }
+    h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+    p  { opacity: 0.85; margin-bottom: 2rem; font-size: 1rem; }
+    .links { display: flex; flex-direction: column; gap: 1rem; }
+    a {
+      display: block;
+      padding: 0.75rem 1.5rem;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 1rem;
+      transition: opacity 0.2s;
+    }
+    a:hover { opacity: 0.85; }
+    .btn-primary  { background: #fff; color: #764ba2; }
+    .btn-secondary { background: rgba(255,255,255,0.2); color: #fff; border: 1px solid rgba(255,255,255,0.4); }
+    .status { margin-top: 2rem; font-size: 0.8rem; opacity: 0.65; }
   </style>
 </head>
 <body>
- 
+  <div class="card">
+    <h1>🚗 Car Counter API</h1>
+    <p>Backend is running. Use the links below to get started.</p>
+    <div class="links">
+      <a class="btn-primary" href="http://localhost:3001">Open Dashboard (Frontend)</a>
+      <a class="btn-secondary" href="/api-docs">API Documentation (Swagger)</a>
+    </div>
+    <div class="status">Backend API &nbsp;•&nbsp; Port ${process.env.PORT || 3000}</div>
+  </div>
 </body>
 </html>
   `;
